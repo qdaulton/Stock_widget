@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import List, Optional
+
 from pydantic import BaseModel
 
 
@@ -16,21 +17,17 @@ class PriceUpdateMessage(BaseModel):
     data: List[StockPrice]
 
 
-# ===== Alert models =====
-
 class AlertRule(BaseModel):
     """
-    A simple alert rule, e.g.:
-      AAPL > 200
-      TSLA < 180
+    A single alert rule such as "AAPL > 200".
     """
     id: int
     symbol: str
-    operator: str  # one of ">", "<", ">=", "<=", "=="
+    operator: str  # ">" or "<"
     threshold: float
     description: str
     enabled: bool = True
-    cooldown_seconds: int = 60  # minimum time between triggers
+    cooldown_seconds: int = 60
     last_triggered: Optional[datetime] = None
 
 

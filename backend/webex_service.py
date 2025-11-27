@@ -1,7 +1,7 @@
 import json
 import os
 from typing import Optional
-from urllib.error import URLError, HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from models import AlertEvent
@@ -15,54 +15,57 @@ class WebexNotifier:
       - WEBEX_BOT_TOKEN : Bot access token
       - WEBEX_ROOM_ID   : Target roomId to post messages into
 
-    If these are not set, sending is silently skipped
-    (so your backend still works in environments without WebEx).
+    If configuration is missing, the notifier becomes a no-op but
+    logs what it *would* have sent.
     """
 
-    def __init__(self):
-        self.token = os.getenv("WEBEX_BOT_TOKEN")
-        self.room_id = os.getenv("WEBEX_ROOM_ID")
+    def __init__(self, bot_token: Optional[str], room_id: Optional[str]):
+        self.bot_token = bot_token
+        self.room_id = room_id
 
-        if not self.token or not self.room_id:
-            print("[webex] WEBEX_BOT_TOKEN or WEBEX_ROOM_ID not set; WebEx alerts disabled.")
-            self.enabled = False
-        else:
-            print("[webex] WebEx notifier enabled (room-based).")
-            self.enabled = True
+        if not self.bot_token or not self.room_id:
+            print("[webex] WARNING: WebEx not fully configured; alerts will be logged only.")
 
-    def _build_message_text(self, event: AlertEvent) -> str:
-        return (
-            f"🚨 Stock Alert\n"
-            f"Rule ID: {event.rule_id}\n"
-            f"Symbol: {event.symbol}\n"
-            f"Triggered at: {event.triggered_at.isoformat()}\n"
-            f"Price: {event.price:.2f}\n"
-            f"Details: {event.message}"
-        )
+    @classmethod
+    def from_env(cls) -> "WebexNotifier":
+        token = os.getenv("WEBEX_BOT_TOKEN")
+        room_id = os.getenv("WEBEX_ROOM_ID")
+        return cls(bot_token=token, room_id=room_id)
+
+    # --------------- public API ---------------
+
+    def is_configured(self) -> bool:
+        return bool(self.bot_token and self.room_id)
 
     def send_alert(self, event: AlertEvent) -> None:
-        if not self.enabled:
+        """
+        Post a simple message into the configured WebEx room.
+        """
+        if not self.is_configured():
+            print(f"[webex] (dry-run) Would send alert to WebEx: {event.message}")
             return
 
         url = "https://webexapis.com/v1/messages"
-        text = self._build_message_text(event)
-
-        body = {
-            "roomId": self.room_id,
-            "text": text,
-        }
-        data = json.dumps(body).encode("utf-8")
-
         headers = {
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {self.bot_token}",
             "Content-Type": "application/json",
         }
 
+        text = (
+            f"🚨 Stock Alert: {event.symbol}\n"
+            f"{event.message}\n"
+            f"Triggered at {event.triggered_at.isoformat()}"
+        )
+        payload = {
+            "roomId": self.room_id,
+            "text": text,
+        }
+
+        data = json.dumps(payload).encode("utf-8")
         req = Request(url, data=data, headers=headers, method="POST")
 
         try:
             with urlopen(req, timeout=5) as resp:
-                # We don't really need the response body; just ensure no exception is raised.
                 resp.read()
             print(f"[webex] Alert sent to WebEx for rule {event.rule_id} ({event.symbol}).")
         except HTTPError as e:

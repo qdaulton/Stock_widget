@@ -1,19 +1,44 @@
-# Python
+# ===========================
+# PYTHON
+# ===========================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.env
+
+# ===========================
+# VENV / ENVIRONMENTS
+# ===========================
 venv/
+env/
+ENV/
+.venv/
 
-# Docker
-*.log
-
-# VS Code
-.vscode/
-
-# Environment
+# ===========================
+# ENV FILES (IMPORTANT)
+# ===========================
 .env
+*.env
 
-# Byte-compiled
+# ===========================
+# DOCKER
+# ===========================
+__debug_bin
+*.log
+*.pid
+
+# ===========================
+# FRONTEND (future react/vite support)
+# ===========================
+node_modules/
+dist/
+build/
+
+# ===========================
+# EDITORS / OS FILES
+# ===========================
+.vscode/
+.idea/
+.DS_Store
 *.swp
+

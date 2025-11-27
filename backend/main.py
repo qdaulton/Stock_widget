@@ -1,10 +1,11 @@
 import asyncio
-from typing import List
+from typing import List, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
 
-from models import PriceUpdateMessage, StockPrice, AlertEvent
+from models import StockPrice, PriceUpdateMessage, AlertRule, AlertEvent
 from stocks_service import StockPriceProvider
 from cache_service import PriceCache
 from alert_service import AlertManager
@@ -12,6 +13,7 @@ from webex_service import WebexNotifier
 
 app = FastAPI(title="SmartStock Monitor Backend")
 
+# Allow the frontend (served by nginx or file://) to talk to the API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,145 +22,142 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# -------- logging middleware (handy for demo) --------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f">>> {request.method} {request.url.path}")
+    response = await call_next(request)
+    print(f"<<< {request.method} {request.url.path} -> {response.status_code}")
+    return response
+
+
+# -------- global services --------
+
 price_provider = StockPriceProvider()
-price_cache = PriceCache()          # Redis or in-memory
-alert_manager = AlertManager()      # In-memory alert engine
-webex_notifier = WebexNotifier()    # WebEx bot notifier
+price_cache = PriceCache()
 
+# demo rules; tweak thresholds as you like
+alert_rules = {
+    1: AlertRule(id=1, symbol="AAPL", operator=">", threshold=200, description="AAPL > 200 (notify WebEx)"),
+    2: AlertRule(id=2, symbol="TSLA", operator=">", threshold=180, description="TSLA > 180 (notify WebEx)"),
+    3: AlertRule(id=3, symbol="NVDA", operator=">", threshold=1000, description="NVDA > 1000 (high priority)"),
+}
+alert_manager = AlertManager(alert_rules)
 
-# ===== DEMO / REAL ALERT RULES SWITCH =====
-USE_DEMO_ALERT_RULES = True  # set False for "real" thresholds
-
-
-def load_alert_rules():
-    if USE_DEMO_ALERT_RULES:
-        print("[alerts] Loading DEMO alert rules")
-        # These are intentionally easy so they trigger quickly (with real or mock prices)
-        alert_manager.add_rule(
-            symbol="AAPL",
-            operator=">",
-            threshold=0,
-            description="DEMO: AAPL > 0",
-            cooldown_seconds=10,
-        )
-        alert_manager.add_rule(
-            symbol="TSLA",
-            operator=">",
-            threshold=0,
-            description="DEMO: TSLA > 0",
-            cooldown_seconds=10,
-        )
-        alert_manager.add_rule(
-            symbol="NVDA",
-            operator=">",
-            threshold=0,
-            description="DEMO: NVDA > 0",
-            cooldown_seconds=10,
-        )
-    else:
-        print("[alerts] Loading REAL alert rules")
-        alert_manager.add_rule(
-            symbol="AAPL",
-            operator=">",
-            threshold=200,
-            description="AAPL > 200 (Notify WebEx)",
-            cooldown_seconds=60,
-        )
-        alert_manager.add_rule(
-            symbol="TSLA",
-            operator="<",
-            threshold=180,
-            description="TSLA < 180 (Notify WebEx)",
-            cooldown_seconds=60,
-        )
-        alert_manager.add_rule(
-            symbol="NVDA",
-            operator=">",
-            threshold=1000,
-            description="NVDA > 1000 (High priority)",
-            cooldown_seconds=60,
-        )
-
-
-# Load rules at startup
-load_alert_rules()
-
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "ok",
-        "cache_backend": price_cache.backend,
-        "alert_rules": [r.dict() for r in alert_manager.list_rules()],
-        "webex_enabled": webex_notifier.enabled,
-    }
-
-
-@app.get("/alerts/events")
-async def list_alert_events() -> List[AlertEvent]:
-    """
-    View recent alert events (for debugging/demo).
-    """
-    return alert_manager.recent_events()
+webex_notifier = WebexNotifier.from_env()
 
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active: Set[WebSocket] = set()
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active.add(websocket)
+        print(f"[ws] client connected, total={len(self.active)}")
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        if websocket in self.active:
+            self.active.remove(websocket)
+            print(f"[ws] client disconnected, total={len(self.active)}")
 
-    async def broadcast(self, message: str):
-        for connection in list(self.active_connections):
+    async def broadcast_json(self, payload):
+        disconnected: List[WebSocket] = []
+        for ws in list(self.active):
             try:
-                await connection.send_text(message)
+                await ws.send_json(payload)
             except Exception:
-                self.disconnect(connection)
+                disconnected.append(ws)
+        for ws in disconnected:
+            self.disconnect(ws)
 
 
 manager = ConnectionManager()
 
 
-async def get_fresh_prices() -> List[StockPrice]:
-    """
-    1. Try cached prices if they are recent.
-    2. Otherwise fetch from Finnhub (or mock), cache them.
-    3. Evaluate alert rules and log/send events.
-    """
-    cached = price_cache.load_prices(max_age_seconds=20)
-    if cached is not None:
-        prices = cached
-    else:
-        prices = price_provider.get_price_snapshot()
-        price_cache.save_prices(prices)
+# -------- simple REST endpoints --------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
-    # Evaluate alert rules
-    events = alert_manager.check_alerts(prices)
-    for event in events:
-        # Log to backend console
-        print(f"[alert] {event.message}")
-        # Send to WebEx (if configured)
-        webex_notifier.send_alert(event)
 
+@app.get("/api/prices", response_model=List[StockPrice])
+async def get_prices_once():
+    """
+    REST endpoint mainly for debugging; the UI uses WebSockets instead.
+    """
+    cached = price_cache.get_snapshot()
+    if cached:
+        return cached
+
+    prices = price_provider.get_prices()
+    price_cache.set_snapshot(prices)
     return prices
+
+
+@app.get("/alerts/rules", response_model=List[AlertRule])
+async def get_alert_rules():
+    return alert_manager.rules
+
+
+@app.post("/alerts/rules", response_model=AlertRule)
+async def add_alert_rule(rule: AlertRule = Body(...)):
+    alert_manager.add_rule(rule)
+    return rule
+
+
+@app.get("/alerts/events", response_model=List[AlertEvent])
+async def get_recent_events():
+    return alert_manager.recent_events()
+
+
+# -------- websocket helpers --------
+async def _compute_and_broadcast_prices():
+    """
+    Helper used by the websocket loop: get latest prices (cache + provider),
+    update cache, run alert engine, send everything to clients.
+    """
+    prices = price_cache.get_snapshot()
+    if prices is None:
+        prices = price_provider.get_prices()
+        price_cache.set_snapshot(prices)
+
+    # send price update (ensure datetimes are JSON-serializable)
+    msg = PriceUpdateMessage(data=prices)
+    await manager.broadcast_json(msg.model_dump(mode="json"))
+
+    # evaluate alerts
+    events = alert_manager.evaluate(prices)
+    for event in events:
+        # send to WebEx (if configured)
+        webex_notifier.send_alert(event)
+        # broadcast alert to clients
+        await manager.broadcast_json({
+            "type": "alert",
+            "rule_id": event.rule_id,
+            "symbol": event.symbol,
+            "price": event.price,
+            "triggered_at": event.triggered_at.isoformat(),
+            "message": event.message,
+        })
 
 
 @app.websocket("/ws/prices")
 async def websocket_prices(websocket: WebSocket):
     await manager.connect(websocket)
-    try:
-        while True:
-            prices = await get_fresh_prices()
-            msg = PriceUpdateMessage(data=prices)
-            await websocket.send_text(msg.model_dump_json())
 
-            # Thanks to cache, multiple clients share the same snapshot.
+    # On connect, send cached snapshot immediately if available
+    cached = price_cache.get_snapshot()
+    if cached:
+        snapshot_msg = PriceUpdateMessage(data=cached)
+        # IMPORTANT: mode="json" so datetime -> ISO string
+        await websocket.send_json(snapshot_msg.model_dump(mode="json"))
+
+    try:
+        # Simple loop: every 10 seconds update prices and alerts
+        while True:
+            await _compute_and_broadcast_prices()
             await asyncio.sleep(10)
     except WebSocketDisconnect:
         manager.disconnect(websocket)
